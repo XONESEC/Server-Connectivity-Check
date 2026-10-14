@@ -1,107 +1,74 @@
-
 import platform
 import socket
-import subprocess
-import streamlit as st
 import ipaddress
 import re
+import time
+from datetime import datetime
+
+import streamlit as st
 
 st.set_page_config(
     page_title="Server Connectivity Check",
     page_icon="🌐",
-    layout="centered"
+    layout="centered",
 )
 
 st.title("🌐 Server Connectivity Check")
 st.write(
-    "Deteksi nama komputer dan alamat IP lokal, "
-    "lalu uji koneksi TCP ke server tujuan."
+    "Detect the runtime hostname and IP addresses, "
+    "then test TCP connectivity to a target server."
 )
 
 
 # ==================================================
-# DETEKSI INFORMASI KOMPUTER LOKAL
+# LOCAL COMPUTER INFORMATION
 # ==================================================
 
 def get_local_info():
-    server_name = platform.node() or socket.gethostname()
+    hostname = platform.node() or socket.gethostname()
     ips = set()
 
-    ps_command = (
-        "Get-NetIPAddress -AddressFamily IPv4 "
-        "| Where-Object { $_.IPAddress -ne '127.0.0.1' "
-        "-and $_.AddressState -eq 'Preferred' } "
-        "| Select-Object -ExpandProperty IPAddress"
-    )
-
     try:
-        result = subprocess.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                ps_command
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False
-        )
+        for result in socket.getaddrinfo(
+            socket.gethostname(),
+            None,
+            family=socket.AF_INET,
+        ):
+            ip = result[4][0]
+            if not ip.startswith("127."):
+                ips.add(ip)
+    except socket.gaierror:
+        pass
 
-        if result.returncode == 0:
-            ips.update(
-                line.strip()
-                for line in result.stdout.splitlines()
-                if line.strip()
-            )
-        else:
-            st.warning(
-                "PowerShell tidak dapat mengambil daftar IP. "
-                "Mencoba metode alternatif."
-            )
+    # Include the default outbound interface IP when available.
+    # UDP connect does not send application data.
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 80))
+            local_ip = s.getsockname()[0]
+            if local_ip and not local_ip.startswith("127."):
+                ips.add(local_ip)
+    except OSError:
+        pass
 
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        st.warning(
-            "PowerShell tidak tersedia atau deteksi IP timeout."
-        )
-
-    # Fallback jika PowerShell gagal
-    if not ips:
-        try:
-            ips.update(
-                ip for ip in socket.gethostbyname_ex(
-                    socket.gethostname()
-                )[2]
-                if ip and not ip.startswith("127.")
-            )
-        except socket.gaierror:
-            pass
-
-    return server_name, sorted(ips)
+    return hostname, sorted(ips)
 
 
 # ==================================================
-# VALIDASI TARGET SERVER
+# TARGET VALIDATION
 # ==================================================
 
 def validate_target(target):
     target = target.strip()
 
-    if not target:
+    if not target or len(target) > 253:
         return False
 
-    # Mendukung alamat IPv4
     try:
         ipaddress.ip_address(target)
         return True
     except ValueError:
         pass
-
-    # Mendukung hostname atau FQDN
-    if len(target) > 253:
-        return False
 
     hostname_pattern = (
         r"^(?=.{1,253}$)"
@@ -115,180 +82,196 @@ def validate_target(target):
 
 
 # ==================================================
-# TEST KONEKSI TCP
+# TCP CONNECTIVITY TEST
 # ==================================================
 
-def test_connection(target_server, target_port):
-    # Escape tanda kutip tunggal untuk PowerShell
-    safe_server = target_server.replace("'", "''")
-
-    ps_command = (
-        f"$r = Test-NetConnection "
-        f"-ComputerName '{safe_server}' "
-        f"-Port {target_port} "
-        "-WarningAction SilentlyContinue; "
-        "$r | Select-Object ComputerName,RemoteAddress,"
-        "RemotePort,InterfaceAlias,SourceAddress,"
-        "TcpTestSucceeded | Format-List"
-    )
+def test_connection(target_server, target_port, timeout=5):
+    start_time = time.perf_counter()
+    timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
     try:
-        result = subprocess.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                ps_command
-            ],
-            capture_output=True,
-            text=True,
-            timeout=35,
-            check=False
-        )
+        # Resolve hostname and establish TCP connection.
+        with socket.create_connection(
+            (target_server, target_port),
+            timeout=timeout,
+        ) as conn:
+            remote_ip = conn.getpeername()[0]
+            local_ip = conn.getsockname()[0]
 
-        return (
-            result.stdout.strip(),
-            result.stderr.strip(),
-            result.returncode
-        )
+        elapsed = (time.perf_counter() - start_time) * 1000
 
-    except FileNotFoundError:
-        return (
-            "",
-            "PowerShell tidak ditemukan. "
-            "Jalankan aplikasi di Windows.",
-            1
-        )
+        return {
+            "success": True,
+            "target": target_server,
+            "remote_ip": remote_ip,
+            "port": target_port,
+            "source_ip": local_ip,
+            "duration_ms": round(elapsed, 2),
+            "timestamp": timestamp,
+            "message": "TCP connection established successfully.",
+        }
 
-    except subprocess.TimeoutExpired:
-        return (
-            "",
-            "Pemeriksaan koneksi melebihi batas waktu 35 detik.",
-            1
-        )
+    except socket.gaierror as exc:
+        message = f"Hostname resolution failed: {exc}"
+
+    except (socket.timeout, TimeoutError):
+        message = f"Connection timed out after {timeout} seconds."
+
+    except ConnectionRefusedError:
+        message = "Connection refused. The port may not be listening."
+
+    except OSError as exc:
+        message = f"Network error: {exc}"
+
+    elapsed = (time.perf_counter() - start_time) * 1000
+
+    return {
+        "success": False,
+        "target": target_server,
+        "remote_ip": "-",
+        "port": target_port,
+        "source_ip": "-",
+        "duration_ms": round(elapsed, 2),
+        "timestamp": timestamp,
+        "message": message,
+    }
 
 
 # ==================================================
-# INFORMASI KOMPUTER
+# DISPLAY RUNTIME INFORMATION
 # ==================================================
 
-server_name, local_ips = get_local_info()
+hostname, local_ips = get_local_info()
 
-st.subheader("1. Informasi Komputer Lokal")
+st.subheader("1. Runtime Information")
+st.caption(
+    "These details belong to the machine running the Streamlit app, "
+    "which may be a cloud server rather than your workstation."
+)
 
-st.metric("Computer Name / Hostname", server_name)
+st.metric("Runtime Hostname", hostname)
 
 if local_ips:
-    st.write("**IP address lokal yang terdeteksi:**")
-
+    st.write("**Detected local IPv4 addresses:**")
     for ip in local_ips:
         st.code(ip, language=None)
 else:
-    st.warning("Alamat IP lokal tidak berhasil dideteksi.")
+    st.info("No local IPv4 address could be detected.")
 
 
 # ==================================================
-# INPUT SERVER DAN PORT
+# TARGET CONFIGURATION
 # ==================================================
 
 st.divider()
-st.subheader("2. Konfigurasi Target Server")
+st.subheader("2. Target Server Configuration")
 
-col1, col2 = st.columns([3, 1])
+with st.form("connectivity_form"):
+    col1, col2 = st.columns([3, 1])
 
-with col1:
-    target_server = st.text_input(
-        "Target Server IP / Hostname",
-        value="192.168.21.14",
-        placeholder="Contoh: 192.168.21.14",
-        help="Masukkan alamat IP atau hostname server."
-    ).strip()
+    with col1:
+        target_server = st.text_input(
+            "Target Server IP / Hostname",
+            value="192.168.21.14",
+            placeholder="Example: 192.168.21.14",
+        ).strip()
 
-with col2:
-    target_port = st.number_input(
-        "Target Port",
+    with col2:
+        target_port = st.number_input(
+            "TCP Port",
+            min_value=1,
+            max_value=65535,
+            value=5093,
+            step=1,
+        )
+
+    timeout = st.slider(
+        "Connection Timeout (seconds)",
         min_value=1,
-        max_value=65535,
-        value=5093,
-        step=1,
-        help="Port TCP yang ingin diperiksa."
+        max_value=30,
+        value=5,
     )
 
-st.info(
-    f"Target pengujian: {target_server or '-'}:{int(target_port)}"
-)
+    submitted = st.form_submit_button(
+        "Test TCP Connection",
+        type="primary",
+        use_container_width=True,
+    )
 
 
 # ==================================================
-# EKSEKUSI TEST-NETCONNECTION
+# RUN TEST
 # ==================================================
 
-if st.button(
-    "Jalankan Test-NetConnection",
-    type="primary",
-    use_container_width=True
-):
+if submitted:
     if not validate_target(target_server):
-        st.error(
-            "Masukkan alamat IPv4 atau hostname server yang valid."
-        )
+        st.error("Enter a valid IP address or hostname.")
 
     else:
         with st.spinner(
-            f"Menguji koneksi ke "
-            f"{target_server}:{int(target_port)}..."
+            f"Testing {target_server}:{int(target_port)}..."
         ):
-            stdout, stderr, returncode = test_connection(
+            result = test_connection(
                 target_server,
-                int(target_port)
+                int(target_port),
+                timeout=int(timeout),
             )
 
-        st.subheader("3. Hasil Pengujian")
+        st.divider()
+        st.subheader("3. Connection Test Results")
 
-        if stdout:
-            st.text_area(
-                "Hasil PowerShell",
-                value=stdout,
-                height=240
+        if result["success"]:
+            st.success(result["message"])
+        else:
+            st.error(result["message"])
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric(
+                "TCP Status",
+                "SUCCESS" if result["success"] else "FAILED",
+            )
+        with col2:
+            st.metric(
+                "Response Time",
+                f'{result["duration_ms"]} ms',
             )
 
-            if "TcpTestSucceeded : True" in stdout:
-                st.success(
-                    f"Koneksi TCP ke {target_server}:"
-                    f"{int(target_port)} berhasil."
-                )
+        st.write("**Detailed Results**")
 
-            elif "TcpTestSucceeded : False" in stdout:
-                st.error(
-                    f"Koneksi TCP ke {target_server}:"
-                    f"{int(target_port)} gagal."
-                )
+        st.table(
+            {
+                "Property": [
+                    "Test Time",
+                    "Target Server",
+                    "Resolved Remote IP",
+                    "Target Port",
+                    "Source IP",
+                    "TCP Connection",
+                    "Duration",
+                    "Result",
+                ],
+                "Value": [
+                    result["timestamp"],
+                    result["target"],
+                    result["remote_ip"],
+                    result["port"],
+                    result["source_ip"],
+                    str(result["success"]),
+                    f'{result["duration_ms"]} ms',
+                    result["message"],
+                ],
+            }
+        )
 
-            else:
-                st.info(
-                    "Perintah selesai. "
-                    "Periksa hasil PowerShell di atas."
-                )
-
-        if stderr:
-            st.warning(stderr)
-
-        if not stdout and not stderr:
-            st.error(
-                "Perintah tidak menghasilkan output "
-                f"(exit code: {returncode})."
-            )
+        st.caption(
+            "The test is executed from the machine hosting Streamlit."
+        )
 
 
-# ==================================================
-# CATATAN
-# ==================================================
-
+st.divider()
 st.caption(
-    "Catatan: jalankan aplikasi pada komputer Windows "
-    "yang ingin diuji. Informasi IP lokal dan hasil "
-    "Test-NetConnection berasal dari komputer tempat "
-    "proses Streamlit berjalan."
+    "Note: a successful TCP test confirms that a TCP connection "
+    "could be established from the runtime to the specified target. "
+    "It does not verify that the licensing application itself is functional."
 )
